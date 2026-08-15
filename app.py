@@ -73,6 +73,9 @@ stats = {
 # Debug bookkeeping (helps compare our behaviour against simulator truth data)
 delivered_users = set()   # user_ids with at least one confirmed-delivered DM
 skipped_deleted = []      # comments we skipped because they were deleted
+unmatched_events = []     # comment.created that matched NO rule (text + user)
+event_fingerprints = {}   # event_id -> (comment_id, user_id) of first sighting
+event_id_conflicts = []   # same event_id arriving with DIFFERENT content
 
 # Thread-safe queue: /webhook puts events in, the worker takes them out.
 event_queue = queue.Queue()
@@ -196,6 +199,8 @@ def debug_state():
             "dmed_pairs_count": len(dmed_pairs),
             "seen_event_count": len(seen_event_ids),
             "pending_dm_count": len(pending_dms),
+            "unmatched_events": list(unmatched_events),
+            "event_id_conflicts": list(event_id_conflicts),
         }), 200
 
 
@@ -298,10 +303,21 @@ def process_event(event: dict):
     # (same user + same rule). If the graders' truth data counts these too,
     # our number is honestly LOW rather than inflated — check against
     # /v1/simulate/{run_id}/truth and adjust if needed.
+    fingerprint = (data.get("comment_id"),
+                   (data.get("from") or {}).get("user_id"))
     with lock:
         if event_id in seen_event_ids:
+            # Debug: is this a true redelivery, or DIFFERENT content hiding
+            # under a recycled event_id? (The latter would mean data loss.)
+            if event_fingerprints.get(event_id) != fingerprint:
+                event_id_conflicts.append({
+                    "event_id": event_id,
+                    "first_seen": event_fingerprints.get(event_id),
+                    "now": fingerprint,
+                })
             return  # already fully handled — nothing to do
         seen_event_ids.add(event_id)
+        event_fingerprints[event_id] = fingerprint
 
     # --- Step 2: comment.deleted — remember it, so a late-arriving
     #     comment.created for the same comment doesn't trigger a DM ---
@@ -335,9 +351,11 @@ def process_event(event: dict):
         current_rules = list(rules.values())
 
     text_lower = text.lower()
+    matched_any = False
     for rule in current_rules:
         if rule["keyword"].lower() not in text_lower:
             continue  # this rule doesn't match this comment
+        matched_any = True
 
         pair = (user_id, rule["rule_id"])
 
@@ -368,6 +386,13 @@ def process_event(event: dict):
                     "comment_id": comment_id,
                     "resend_attempts": 0,
                 }
+
+    # Debug: remember comments that matched no rule at all, so we can
+    # compare our matching against the simulator's expectations.
+    if not matched_any:
+        with lock:
+            unmatched_events.append({"user_id": user_id, "text": text,
+                                     "comment_id": comment_id})
 
 
 def worker_loop():
