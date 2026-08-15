@@ -465,6 +465,26 @@ def reconciler_loop():
 # the same process that handles the traffic.
 # ---------------------------------------------------------------------------
 
+def keepalive_loop():
+    """Ping our own public URL every 10 minutes.
+
+    Render's free tier puts the app to sleep after ~15 minutes without
+    traffic; a sleeping app returns nothing until it wakes (50s+), which
+    would make us drop webhook events. Render provides our public URL in
+    the RENDER_EXTERNAL_URL env var, so we simply visit ourselves.
+    """
+    url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not url:
+        return  # not running on Render (e.g., local dev) — nothing to do
+    while True:
+        time.sleep(600)  # 10 minutes
+        try:
+            requests.get(url, timeout=30)
+            print(f"[keepalive] pinged {url}")
+        except requests.RequestException as exc:
+            print(f"[keepalive] ping failed: {exc}")
+
+
 _threads_started = False
 _thread_start_lock = threading.Lock()
 
@@ -478,8 +498,9 @@ def ensure_background_threads():
             return
         threading.Thread(target=worker_loop, daemon=True).start()
         threading.Thread(target=reconciler_loop, daemon=True).start()
+        threading.Thread(target=keepalive_loop, daemon=True).start()
         _threads_started = True
-        print("[startup] background worker + reconciler threads started")
+        print("[startup] background worker + reconciler + keepalive threads started")
 
 
 @app.before_request
