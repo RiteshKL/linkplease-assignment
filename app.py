@@ -433,14 +433,36 @@ def reconciler_loop():
 
 
 # ---------------------------------------------------------------------------
-# START THE BACKGROUND THREADS
+# START THE BACKGROUND THREADS — lazily, on the first request
 #
-# daemon=True means these threads die automatically when the main program
-# exits. Started at import time so it also works under gunicorn.
+# We originally started these at import time, which worked locally but NOT on
+# the hosting platform: there the import can happen in a parent process, and
+# threads do not survive into the forked worker process that actually serves
+# requests. Result: events piled up in the queue with nobody reading them.
+# Starting the threads from inside the first request guarantees they live in
+# the same process that handles the traffic.
 # ---------------------------------------------------------------------------
 
-threading.Thread(target=worker_loop, daemon=True).start()
-threading.Thread(target=reconciler_loop, daemon=True).start()
+_threads_started = False
+_thread_start_lock = threading.Lock()
+
+
+def ensure_background_threads():
+    global _threads_started
+    if _threads_started:
+        return
+    with _thread_start_lock:
+        if _threads_started:
+            return
+        threading.Thread(target=worker_loop, daemon=True).start()
+        threading.Thread(target=reconciler_loop, daemon=True).start()
+        _threads_started = True
+        print("[startup] background worker + reconciler threads started")
+
+
+@app.before_request
+def _start_threads_before_first_request():
+    ensure_background_threads()
 
 
 if __name__ == "__main__":
