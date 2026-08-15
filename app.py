@@ -17,6 +17,7 @@ HOW TO RUN:
   python app.py
 """
 
+import base64
 import hashlib
 import hmac
 import os
@@ -82,13 +83,36 @@ event_queue = queue.Queue()
 # somebody forged the request and we reject it.
 # ---------------------------------------------------------------------------
 
+def _signing_secrets():
+    """Secrets the webhook signature might be based on.
+
+    The docs say the secret is the API key — but by capturing real deliveries
+    we discovered the live API actually signs with the account EMAIL. The
+    email is recoverable from the key itself (the base64 chunk before the
+    dot), so we accept a signature made with either. No extra config needed.
+    """
+    secrets = [API_KEY.encode()]
+    try:
+        b64_part = API_KEY.split(".")[0]
+        padded = b64_part + "=" * (-len(b64_part) % 4)
+        email = base64.b64decode(padded)
+        if email:
+            secrets.append(email)
+    except Exception:
+        pass  # key not in the expected format — just use the key itself
+    return secrets
+
+
 def signature_is_valid(raw_body: bytes, header_value: str) -> bool:
     if not header_value or not header_value.startswith("sha256="):
         return False
-    received_hex = header_value[len("sha256="):]
-    expected_hex = hmac.new(API_KEY.encode(), raw_body, hashlib.sha256).hexdigest()
-    # compare_digest prevents timing attacks (constant-time comparison)
-    return hmac.compare_digest(received_hex, expected_hex)
+    received_hex = header_value[len("sha256="):].strip().lower()
+    for secret in _signing_secrets():
+        expected_hex = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
+        # compare_digest prevents timing attacks (constant-time comparison)
+        if hmac.compare_digest(received_hex, expected_hex):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
