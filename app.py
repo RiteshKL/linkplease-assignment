@@ -70,6 +70,10 @@ stats = {
     "duplicates_blocked": 0, # DMs we correctly chose NOT to send
 }
 
+# Debug bookkeeping (helps compare our behaviour against simulator truth data)
+delivered_users = set()   # user_ids with at least one confirmed-delivered DM
+skipped_deleted = []      # comments we skipped because they were deleted
+
 # Thread-safe queue: /webhook puts events in, the worker takes them out.
 event_queue = queue.Queue()
 
@@ -178,6 +182,21 @@ def get_stats():
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({"service": "linkplease-assignment", "status": "running"}), 200
+
+
+# Debug view — lets us diff our behaviour against the simulator's truth data.
+@app.route("/debug/state", methods=["GET"])
+def debug_state():
+    with lock:
+        return jsonify({
+            "rules": list(rules.values()),
+            "delivered_users": sorted(delivered_users),
+            "skipped_because_deleted": list(skipped_deleted),
+            "deleted_comment_ids": sorted(deleted_comments),
+            "dmed_pairs_count": len(dmed_pairs),
+            "seen_event_count": len(seen_event_ids),
+            "pending_dm_count": len(pending_dms),
+        }), 200
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +326,8 @@ def process_event(event: dict):
     # --- Step 3: if this comment was already deleted, don't DM ---
     with lock:
         if comment_id in deleted_comments:
+            skipped_deleted.append({"comment_id": comment_id, "user_id": user_id,
+                                    "text": text})
             return
 
     # --- Step 4: match the comment text against every rule ---
@@ -398,9 +419,10 @@ def reconciler_loop():
             if status == "delivered":
                 with lock:
                     if dm_id in pending_dms:
-                        del pending_dms[dm_id]
+                        info = pending_dms.pop(dm_id)
                         stats["queued"] -= 1
                         stats["sent"] += 1
+                        delivered_users.add(info["user_id"])
 
             elif status == "failed":
                 with lock:
